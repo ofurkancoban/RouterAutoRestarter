@@ -13,22 +13,37 @@ from PIL import Image, ImageDraw
 from playwright.sync_api import sync_playwright
 import socket
 import winreg
+import zipfile
+from win10toast_click import ToastNotifier
+
 
 APP_NAME = "RouterAutoRestarter"
+LOG_FILE = Path(os.getenv("LOCALAPPDATA")) / APP_NAME / "router_restarter.log"
+Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
 SETTINGS_FILE = Path.home() / ".router_restarter_config.json"
-LOG_FILE = Path.home() / "router_restarter.log"
 ICON_PATH = Path(getattr(sys, '_MEIPASS', Path(__file__).parent)) / "router.ico"
 EXECUTABLE_PATH = sys.executable
+CHROMIUM_DIR = Path(os.getenv("LOCALAPPDATA")) / APP_NAME / "chromium"
+CHROMIUM_EXE = CHROMIUM_DIR / "chrome-win" / "chrome.exe"
 CHECK_INTERVAL = 60
 REBOOT_WAIT = 180
 settings = {"password": "", "auto_reboot": True, "auto_start": False}
 last_reboot_time = None
 is_running = True
 
+
+Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    filename=str(LOG_FILE),
+    filemode='a',
+    level=logging.INFO,
+    format='[%(asctime)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
 def generate_default_icon():
-    image = Image.new("RGB", (64, 64), (0, 128, 255))
-    draw = ImageDraw.Draw(image)
-    draw.text((18, 20), "M", fill="white")
+    image = Image.new("RGB", (64, 64), (255, 255, 255))
     return image
 
 def load_settings():
@@ -57,20 +72,57 @@ def set_autostart(enable):
     except Exception as e:
         logging.error(f"Autostart error: {e}")
 
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format='[%(asctime)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-
+toaster = ToastNotifier()
 def notify(icon, title, message):
     try:
-        if icon:
-            icon.notify(message, title=title)
+        short_msg = message[:250] + '...' if len(message) > 256 else message
+        toaster.show_toast(
+            title=APP_NAME,
+            msg=short_msg,
+            icon_path=str(ICON_PATH),
+            duration=5,
+            threaded=True
+        )
         logging.info(f"[Notify] {title}: {message}")
     except Exception as e:
         logging.error(f"Notification failed: {e}")
+
+def ensure_chromium():
+    if CHROMIUM_EXE.exists():
+        logging.info("Chromium already exists.")
+        return
+
+    notify(None, APP_NAME, "Setting up Chromium from bundled package...")
+    logging.info("Chromium not found. Extracting...")
+
+    try:
+        zip_path = Path(sys._MEIPASS if hasattr(sys, "_MEIPASS") else Path(__file__).parent) / "chromium.zip"
+        CHROMIUM_DIR.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(CHROMIUM_DIR)
+        logging.info("Chromium extracted from bundled zip.")
+        notify(None, APP_NAME, "Chromium installed. Application is ready.")
+    except Exception as e:
+        logging.error(f"Failed to extract Chromium: {e}")
+        notify(None, APP_NAME, f"Chromium setup failed: {e}")
+
+def delete_chromium(icon, item=None):
+    try:
+        if CHROMIUM_DIR.exists():
+            import shutil
+            shutil.rmtree(CHROMIUM_DIR)
+            notify(icon, APP_NAME, "Chromium deleted.")
+        else:
+            notify(icon, APP_NAME, "Chromium folder does not exist.")
+    except Exception as e:
+        logging.error(f"Failed to delete Chromium: {e}")
+        notify(icon, APP_NAME, f"Error while deleting Chromium: {e}")
+    return True
+
+def reinstall_chromium(icon, item=None):
+    delete_chromium(icon)
+    ensure_chromium()
+    return True
 
 def internet_ok():
     try:
@@ -82,10 +134,10 @@ def internet_ok():
 def reboot_modem(triggered_by_user=False, icon=None):
     global last_reboot_time
     logging.info("Rebooting router...")
-    notify(icon, "RouterAutoRestarter", "Router is being rebooted...")
+    notify(icon, APP_NAME, "Router is being rebooted...")
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=True, executable_path=str(CHROMIUM_EXE))
             context = browser.new_context()
             page = context.new_page()
             page.goto("http://192.168.0.1")
@@ -105,10 +157,11 @@ def reboot_modem(triggered_by_user=False, icon=None):
             page.wait_for_timeout(2000)
             browser.close()
         last_reboot_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        logging.info("Reboot triggered successfully")
+        notify(icon, APP_NAME, "Reboot successful.")
+        icon.menu = build_menu(icon)
     except Exception as e:
         logging.error(f"Router reboot failed: {e}")
-        notify(icon, "Router Restarter", f"Reboot failed: {e}")
+        notify(icon, APP_NAME, f"Reboot failed: {e}")
     return True
 
 def monitor(icon):
@@ -123,7 +176,7 @@ def monitor(icon):
         else:
             if internet_was_down:
                 logging.info("Internet restored")
-                notify(icon, "RouterAutoRestarter", "Internet connection restored.")
+                notify(icon, APP_NAME, "Internet connection restored.")
             internet_was_down = False
         time.sleep(CHECK_INTERVAL)
 
@@ -140,7 +193,7 @@ def show_settings_ui():
             win.iconbitmap(default=str(ICON_PATH))
         except Exception as e:
             logging.warning(f"Failed to set window icon: {e}")
-    win.geometry("220x180+1600+600")
+    win.geometry("250x240+1600+600")
     win.resizable(False, False)
 
     ttk.Label(win, text="Router Password:").pack(pady=(10, 0))
@@ -149,6 +202,8 @@ def show_settings_ui():
 
     ttk.Button(win, text="Save", command=on_save).pack(pady=5)
     ttk.Button(win, text="Open Log", command=lambda: os.startfile(LOG_FILE)).pack(pady=2)
+    ttk.Button(win, text="Reinstall Chromium", command=lambda: reinstall_chromium(None)).pack(pady=2)
+    ttk.Button(win, text="Delete Chromium", command=lambda: delete_chromium(None)).pack(pady=2)
     ttk.Button(win, text="GitHub", command=lambda: os.system("start https://github.com/ofurkancoban/RouterAutoRestarter")).pack(pady=2)
     ttk.Button(win, text="Close", command=win.destroy).pack(pady=(2, 10))
 
@@ -177,11 +232,11 @@ def on_quit(icon, item=None):
 def build_menu(icon):
     return Menu(
         Item("Restart Router Now", lambda icon, item: reboot_modem(triggered_by_user=True, icon=icon)),
-        Item("Auto Reboot", lambda icon, item: toggle_auto_reboot(icon), checked=lambda item: settings.get("auto_reboot", True)),
-        Item("Auto Start with Windows", lambda icon, item: toggle_auto_start(icon), checked=lambda item: settings.get("auto_start", False)),
         Item(f"Last Reboot: {last_reboot_time or 'N/A'}", None, enabled=False),
+        Item("Auto Reboot", lambda icon, item: toggle_auto_reboot(icon), checked=lambda item: settings.get("auto_reboot", True)),
+        Item("Auto Start", lambda icon, item: toggle_auto_start(icon), checked=lambda item: settings.get("auto_start", True)),
+        Item("Open Log", lambda icon, item: os.startfile(LOG_FILE)),
         Item("Settings", lambda icon, item: show_settings_ui()),
-        Item("Open Log File", lambda icon, item: os.startfile(LOG_FILE) or True),
         Item("Quit", lambda icon, item: on_quit(icon))
     )
 
@@ -198,6 +253,7 @@ def run_tray():
 
 if __name__ == "__main__":
     load_settings()
+    ensure_chromium()
     if settings.get("auto_start"):
         set_autostart(True)
     run_tray()
